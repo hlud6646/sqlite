@@ -175,12 +175,13 @@ if __name__ == "__main__":
         print(f"database page size: {pagesize}")
         print(f"number of tables: {sqlite_schema_page_header['n_cells']}")
     elif command == ".tables":
-        offsets = cell_pointer_offsets(sqlite_schema_page, 3, True)
+        offsets = cell_pointer_offsets(sqlite_schema_page, sqlite_schema_page_header['n_cells'], True)
         table_names = []
         for offset in offsets:
             body = read_table_btree_leaf_cell(sqlite_schema_page, offset)
             table_names.append(body[2])
-        table_names.remove("sqlite_sequence")
+        if "sqlite_sequence" in table_names:
+            table_names.remove("sqlite_sequence")
         print(" ".join(table_names))
 
         # print(record_body[:40])
