@@ -14,3 +14,7 @@ serial type. The return value of this function should be a type which
 corresponds to the serial type, but I am resorting to something like
 `("int", 4)` which means a 4 byte integer. I don't like using strings
 this way.
+
+This project is really about
+- can you work with binary data?
+- can you follow complex documentation?

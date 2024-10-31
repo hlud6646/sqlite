@@ -35,10 +35,10 @@ def read_database_header(database_file_path):
         }
 
 
-def read_page(database_file_path, pagesize, offset):
-    """Read the page at the given offset."""
+def read_page(database_file_path, pagesize, page_number):
+    """Read the page. Note that they start counting at 1."""
     with open(database_file_path, "rb") as db_file:
-        db_file.seek(offset)
+        db_file.seek(pagesize * (page_number - 1))
         return db_file.read(pagesize)
 
 
@@ -147,7 +147,9 @@ def read_table_btree_leaf_body(data, serial_types):
         values.append(read_serial(st, data))
         _, bytes_consumed = st
         data = data[bytes_consumed:]
-    return values
+    assert len(values) == 5
+    return dict(zip(['type', 'name', 'tbl_name', 'rootpage', 'sql'], values))
+
 
 
 def read_table_btree_leaf_cell(page, offset):
@@ -163,27 +165,43 @@ def read_table_btree_leaf_cell(page, offset):
     return read_table_btree_leaf_body(payload[header_size:], serial_types)
 
 
+# Dev function; will rename when the purpose is clearer.
+def count_rows(page):
+    header = read_page_header(page)
+    cpos = cell_pointer_offsets(page, header['n_cells'])
+    return len(cpos)
+
+
+
+
 if __name__ == "__main__":
     database_header = read_database_header(database_file_path)
     pagesize = database_header["page_size"]
     # Assert we are UTF-8
     assert database_header["text_encoding"] == 1
-    sqlite_schema_page = read_page(database_file_path, pagesize, 0)
-    sqlite_schema_page_header = read_page_header(sqlite_schema_page, True)
+    schema_page = read_page(database_file_path, pagesize, 1)
+    schema_page_header = read_page_header(schema_page, True)
     if command == ".dbinfo":
         print(f"Magic string: {database_header['magic_header_string']}")
         print(f"database page size: {pagesize}")
-        print(f"number of tables: {sqlite_schema_page_header['n_cells']}")
+        print(f"number of tables: {schema_page_header['n_cells']}")
     elif command == ".tables":
-        offsets = cell_pointer_offsets(sqlite_schema_page, sqlite_schema_page_header['n_cells'], True)
+        offsets = cell_pointer_offsets(schema_page, schema_page_header['n_cells'], True)
         table_names = []
         for offset in offsets:
-            body = read_table_btree_leaf_cell(sqlite_schema_page, offset)
-            table_names.append(body[2])
+            body = read_table_btree_leaf_cell(schema_page, offset)
+            table_names.append(body['tbl_name'])
         if "sqlite_sequence" in table_names:
             table_names.remove("sqlite_sequence")
         print(" ".join(table_names))
-
-        # print(record_body[:40])
+    # Hard parsing for now. Proper parsing later.
+    elif command.startswith("select count(*) from"):
+        tbl_name = command.split(" ")[-1]
+        offsets = cell_pointer_offsets(schema_page, schema_page_header['n_cells'], True)
+        # Rows in the sqilte_schema table
+        rows = (read_table_btree_leaf_cell(schema_page, o) for o in offsets)
+        rootpage_number = next(r for r in rows if r['tbl_name'] == tbl_name)['rootpage']
+        rootpage = read_page(database_file_path, pagesize, rootpage_number)
+        print(count_rows(rootpage))
     else:
         print(f"Invalid command: {command}")
