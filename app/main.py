@@ -8,8 +8,8 @@ What have I learned in this project:
 """
 
 import sys
-
-# import sqlparse - available if you need it!
+import re
+import sqlparse
 
 database_file_path = sys.argv[1]
 command = sys.argv[2]
@@ -42,16 +42,20 @@ def read_page(database_file_path, pagesize, page_number):
         return db_file.read(pagesize)
 
 
-def read_page_header(page, skip_db_header=False):
+def read_page_header(page, skip_db_header=False, interior=False):
     # The first page in a database file contains the database header.
     # If you want to read the page header of this page, you need to read
     # past the database header first.
     if skip_db_header:
         page = page[DATABASE_HEADER_BYTES:]
-    header = page[:8]
+    if interior:
+        header = page[:12]
+    else:
+        header = page[:8]
     return {
         "page_type": header[0],
-        "n_cells": int.from_bytes(header[3:5]),
+        "n_cells": int.from_bytes(header[3:3 + 2]),
+        "cell_content_area": int.from_bytes(header[5:5 + 2])
     }
 
 
@@ -100,7 +104,7 @@ def varints(data):
 def serial_type_from_int(n):
     "Return a tuple of (serial type, n_bytes) as described in '2.1. Record Format'"
     if n == 0:
-        return ("null", 0)
+        return ("NULL", 0)
     if 1 <= n <= 6:
         # Value is a big-endian (n * 8)-bit twos-complement integer.
         return ("int", n)
@@ -122,6 +126,8 @@ def read_serial(serial_type, data):
     Decode data given the serial type and some bytes.
     """
     match serial_type:
+        case ("NULL", 0):
+            return "NULL"
         case ("string", n):
             return data[:n].decode("utf-8")
         case ("int", n):
@@ -147,8 +153,8 @@ def read_table_btree_leaf_body(data, serial_types):
         values.append(read_serial(st, data))
         _, bytes_consumed = st
         data = data[bytes_consumed:]
-    assert len(values) == 5
-    return dict(zip(['type', 'name', 'tbl_name', 'rootpage', 'sql'], values))
+    # return dict(zip(['type', 'name', 'tbl_name', 'rootpage', 'sql'], values))
+    return values
 
 
 
@@ -165,43 +171,88 @@ def read_table_btree_leaf_cell(page, offset):
     return read_table_btree_leaf_body(payload[header_size:], serial_types)
 
 
-# Dev function; will rename when the purpose is clearer.
 def count_rows(page):
     header = read_page_header(page)
-    cpos = cell_pointer_offsets(page, header['n_cells'])
-    return len(cpos)
+    return len(cell_pointer_offsets(page, header['n_cells']))
 
 
 
+# select name from apples
+p_simple_select = re.compile(r"""
+    ^select\s
+    (?P<col_name>\w+)\s
+    from\s
+    (?P<tbl_name>\w+)$
+""", re.VERBOSE | re.IGNORECASE)
+
+
+def handle_dbinfo(database_header, schema_page_header):
+    print(f"Magic string: {database_header['magic_header_string']}")
+    print(f"database page size: {database_header['page_size']}")
+    print(f"number of tables: {schema_page_header['n_cells']}")
+
+def handle_tables(schema_page, schema_page_header):
+    offsets = cell_pointer_offsets(schema_page, schema_page_header['n_cells'], True)
+    table_names = []
+    for offset in offsets:
+        body = read_table_btree_leaf_cell(schema_page, offset)
+        table_names.append(body[2])
+    if "sqlite_sequence" in table_names:
+        table_names.remove("sqlite_sequence")
+    print(" ".join(table_names))
+
+def handle_count(database_file_path, pagesize, schema_page, schema_page_header, tbl_name):
+    offsets = cell_pointer_offsets(schema_page, schema_page_header['n_cells'], True)
+    rows = (read_table_btree_leaf_cell(schema_page, o) for o in offsets)
+    rootpage_number = next(r for r in rows if r[2] == tbl_name)[3]
+    rootpage = read_page(database_file_path, pagesize, rootpage_number)
+    print(count_rows(rootpage))
+
+def handle_select(database_file_path, pagesize, schema_page, schema_page_header, column_name, table_name):
+    offsets = cell_pointer_offsets(schema_page, schema_page_header['n_cells'], True)
+    rows = (read_table_btree_leaf_cell(schema_page, o) for o in offsets)
+    rootpage = next(r for r in rows if r[2] == table_name)        
+    rootpage_number = rootpage[3]
+    rootpage_sql = rootpage[-1]
+    sql = list(sqlparse.parse(rootpage_sql)[0])
+
+    cols = next(token for token in sql if token.value.startswith("("))
+    cols = cols.value[1:-1].split(',')
+    cols = [c.strip().split(" ") for c in cols]
+    col_names = [c[0] for c in cols]
+    col_index = col_names.index(column_name)
+
+    rootpage = read_page(database_file_path, pagesize, rootpage_number)
+    header = read_page_header(rootpage)
+    cpos = cell_pointer_offsets(rootpage, header['n_cells'])
+    for o in cpos:
+        value = read_table_btree_leaf_cell(rootpage, o)[col_index]
+        print(value)
 
 if __name__ == "__main__":
     database_header = read_database_header(database_file_path)
     pagesize = database_header["page_size"]
-    # Assert we are UTF-8
-    assert database_header["text_encoding"] == 1
+    assert database_header["text_encoding"] == 1  # Assert we are UTF-8
     schema_page = read_page(database_file_path, pagesize, 1)
     schema_page_header = read_page_header(schema_page, True)
-    if command == ".dbinfo":
-        print(f"Magic string: {database_header['magic_header_string']}")
-        print(f"database page size: {pagesize}")
-        print(f"number of tables: {schema_page_header['n_cells']}")
-    elif command == ".tables":
-        offsets = cell_pointer_offsets(schema_page, schema_page_header['n_cells'], True)
-        table_names = []
-        for offset in offsets:
-            body = read_table_btree_leaf_cell(schema_page, offset)
-            table_names.append(body['tbl_name'])
-        if "sqlite_sequence" in table_names:
-            table_names.remove("sqlite_sequence")
-        print(" ".join(table_names))
-    # Hard parsing for now. Proper parsing later.
-    elif command.startswith("select count(*) from"):
-        tbl_name = command.split(" ")[-1]
-        offsets = cell_pointer_offsets(schema_page, schema_page_header['n_cells'], True)
-        # Rows in the sqilte_schema table
-        rows = (read_table_btree_leaf_cell(schema_page, o) for o in offsets)
-        rootpage_number = next(r for r in rows if r['tbl_name'] == tbl_name)['rootpage']
-        rootpage = read_page(database_file_path, pagesize, rootpage_number)
-        print(count_rows(rootpage))
-    else:
-        print(f"Invalid command: {command}")
+
+    match command:
+        case ".dbinfo":
+            handle_dbinfo(database_header, schema_page_header)
+        case ".tables":
+            handle_tables(schema_page, schema_page_header)
+        case str() if command.startswith("select count(*) from"):
+            tbl_name = command.split(" ")[-1]
+            handle_count(database_file_path, pagesize, schema_page, schema_page_header, tbl_name)
+        case str() if re.match(p_simple_select, command):
+            match = re.match(p_simple_select, command)
+            handle_select(
+                database_file_path, 
+                pagesize, 
+                schema_page, 
+                schema_page_header,
+                match.group('col_name'),
+                match.group('tbl_name')
+            )
+        case _:
+            print(f"Invalid command: {command}")
