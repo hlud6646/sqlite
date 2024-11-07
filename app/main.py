@@ -177,7 +177,7 @@ def count_rows(page):
 p_select = re.compile(
     r"""
     ^select\s
-    (?P<col_names>(\w+,\s)?\w+)\s
+    (?P<col_names>((\w+,\s)+\w+)|\w+)\s
     from\s
     (?P<tbl_name>\w+)$
     """,
