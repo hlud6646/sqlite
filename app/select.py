@@ -6,11 +6,13 @@ def make_predicate(where_condition):
     cond = where_condition.split()
     assert cond[0].lower() == "where"
     cond.pop(0)
-    column_name, operator, right = cond
+    column_name = cond.pop(0)
+    operator = cond.pop(0)
+    right = " ".join(cond)[1:-1]
     if operator == "=":
         operator = "=="
     def p(left):
-        return eval(f"'{left}' {operator} {right}")
+        return eval(f"'{left}' {operator} '{right}'")
     return (column_name, p)
 
 
