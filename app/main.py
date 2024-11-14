@@ -10,11 +10,12 @@ What have I learned in this project:
 import sys
 import re
 import sqlparse
-from operator import itemgetter
+from itertools import compress
 
+from .select import parse_select, make_predicate
 
-database_file_path = sys.argv[1]
-command = sys.argv[2]
+DATABASE_FILE_PATH = sys.argv[1]
+COMMAND = sys.argv[2]
 
 
 # Refer to the SQLite file format at https://www.sqlite.org/fileformat.html
@@ -25,8 +26,8 @@ PAGE_SIZE_OFFSET = 16
 CELL_COUNT_OFFSET = 3
 
 
-def read_database_header(database_file_path):
-    with open(database_file_path, "rb") as db_file:
+def read_database_header():
+    with open(DATABASE_FILE_PATH, "rb") as db_file:
         data = db_file.read(DATABASE_HEADER_BYTES)
         # Refer to '1.3. The Database Header' for the offsets/lengths.
         return {
@@ -37,11 +38,11 @@ def read_database_header(database_file_path):
         }
 
 
-def read_page(database_file_path, pagesize, page_number):
+def read_page(page_number):
     """Read the page. Note that they start counting at 1."""
-    with open(database_file_path, "rb") as db_file:
-        db_file.seek(pagesize * (page_number - 1))
-        return db_file.read(pagesize)
+    with open(DATABASE_FILE_PATH, "rb") as db_file:
+        db_file.seek(PAGESIZE * (page_number - 1))
+        return db_file.read(PAGESIZE)
 
 
 def read_page_header(page, skip_db_header=False, interior=False):
@@ -163,10 +164,10 @@ def read_schema_table_row():
     pass
 
 
-def schema_table_rows(schema_page):
-    page_header = read_page_header(schema_page, True)
-    offsets = cell_pointer_offsets(schema_page, page_header['n_cells'], True)
-    return (read_table_btree_leaf_cell(schema_page, o) for o in offsets)
+def schema_table_rows():
+    page_header = read_page_header(SCHEMA_PAGE, True)
+    offsets = cell_pointer_offsets(SCHEMA_PAGE, page_header['n_cells'], True)
+    return (read_table_btree_leaf_cell(SCHEMA_PAGE, o) for o in offsets)
 
 
 def count_rows(page):
@@ -179,78 +180,104 @@ p_select = re.compile(
     ^select\s
     (?P<col_names>((\w+,\s)+\w+)|\w+)\s
     from\s
-    (?P<tbl_name>\w+)$
+    (?P<tbl_name>\w+)
+    (\s
+    where\s
+    (?P<condition>(.+))
+    )?
+    $
     """,
     re.VERBOSE | re.IGNORECASE
 )
 
 
-def handle_dbinfo(database_header, schema_page_header):
-    print(f"Magic string: {database_header['magic_header_string']}")
-    print(f"database page size: {database_header['page_size']}")
-    print(f"number of tables: {schema_page_header['n_cells']}")
+def handle_dbinfo():
+    print(f"Magic string: {DATABASE_HEADER['magic_header_string']}")
+    print(f"database page size: {DATABASE_HEADER['page_size']}")
+    print(f"number of tables: {SCHEMA_PAGE_HEADER['n_cells']}")
 
 
-def handle_tables(schema_page):
-    table_names = [row[2] for row in schema_table_rows(schema_page)]
+def handle_tables():
+    table_names = [row[2] for row in schema_table_rows()]
     if "sqlite_sequence" in table_names:
         table_names.remove("sqlite_sequence")
     print(" ".join(table_names))
 
 
-def handle_count(database_file_path, pagesize, schema_page, tbl_name):
-    rootpage_number = next(r for r in schema_table_rows(schema_page) if r[2] == tbl_name)[3]
-    rootpage = read_page(database_file_path, pagesize, rootpage_number)
+def handle_count(tbl_name):
+    rootpage_number = next(r for r in schema_table_rows() if r[2] == tbl_name)[3]
+    rootpage = read_page(rootpage_number)
     print(count_rows(rootpage))
 
 
-def handle_select(database_file_path, pagesize, schema_page, column_names, table_name):
-    rootpage = next(r for r in schema_table_rows(schema_page) if r[2] == table_name)
-    rootpage_number = rootpage[3]
-    rootpage_sql = rootpage[-1]
-    sql = list(sqlparse.parse(rootpage_sql)[0])
 
-    # We need to get the column names from the sql statement that created the
-    # table, in order to retrieve the index of the requested column.
-    cols = next(token for token in sql if token.value.startswith("("))
+def get_rootpage_number(table_name):
+    schema_table_row = next(r for r in schema_table_rows() if r[2] == table_name)
+    return schema_table_row[3]
+
+
+def get_column_names(table_name):
+    schema_table_row = next(r for r in schema_table_rows() if r[2] == table_name)
+    table_sql = schema_table_row[-1]
+    table_sql = list(sqlparse.parse(table_sql)[0])
+    cols = next(token for token in table_sql if token.value.startswith("("))
     cols = cols.value[1:-1].split(',')
     cols = [c.strip().split(" ") for c in cols]
     col_names = [c[0] for c in cols]
-    col_indicies = list(map(lambda name: col_names.index(name), column_names))
+    return col_names[1:]
 
-    rootpage = read_page(database_file_path, pagesize, rootpage_number)
+
+
+def read_table(table_name):
+
+    # Reading the specified table
+    rootpage_number = get_rootpage_number(table_name)
+    rootpage = read_page(rootpage_number)
     header = read_page_header(rootpage)
     cpos = cell_pointer_offsets(rootpage, header['n_cells'])
-    for o in cpos:
-        if len(col_indicies) == 1:
-            print(read_table_btree_leaf_cell(rootpage, o)[col_indicies[0]])
-        else:
-            values = itemgetter(*col_indicies)(read_table_btree_leaf_cell(rootpage, o))
-            print("|".join(values))
+    table = [read_table_btree_leaf_cell(rootpage, o)[1:] for o in cpos]
+    column_names = get_column_names(table_name)
+    return dict(zip(column_names, zip(*table)))
 
 
-if __name__ == "__main__":
-    database_header = read_database_header(database_file_path)
-    pagesize = database_header["page_size"]
-    assert database_header["text_encoding"] == 1  # Assert we are UTF-8
-    schema_page = read_page(database_file_path, pagesize, 1)
-    schema_page_header = read_page_header(schema_page, True)
+def handle_select(command):
+    select_exprs, table_name, condition = parse_select(command)
+    table = read_table(table_name)
 
-    match command:
-        case ".dbinfo":
-            handle_dbinfo(database_header, schema_page_header)
-        case ".tables":
-            handle_tables(schema_page)
-        case str() if command.lower().startswith("select count(*) from"):
-            tbl_name = command.split(" ")[-1]
-            handle_count(database_file_path, pagesize, schema_page, tbl_name)
-        case str() if (match := re.match(p_select, command)):
-            handle_select(
-                database_file_path,
-                pagesize,
-                schema_page,
-                match.group('col_names').split(', '),
-                match.group('tbl_name')
-            )
-        case _:
-            print(f"Invalid command: {command}")
+    # Apply a WHERE... clause to the table
+    column_names = table.keys()
+    if condition:
+        col, predicate = make_predicate(condition)
+        includes = list(map(predicate, table[col]))
+        tmp = zip(*[table[k] for k in table])
+        tmp = compress(tmp, includes)
+        table = dict(zip(column_names, zip(*tmp)))
+
+    # Collect the columns that appear in the select_statement
+    table = {k:table[k] for k in (e[1] for e in select_exprs)}
+    table = zip(*table.values())    
+    for row in table:
+        print("|".join(row))
+
+        
+DATABASE_HEADER = read_database_header()
+PAGESIZE = DATABASE_HEADER["page_size"]
+assert DATABASE_HEADER["text_encoding"] == 1  # Assert we are UTF-8
+SCHEMA_PAGE = read_page(1)
+SCHEMA_PAGE_HEADER = read_page_header(SCHEMA_PAGE, True)
+
+match COMMAND:
+    case ".dbinfo":
+        handle_dbinfo()
+    case ".tables":
+        handle_tables()
+    # Specialised select for this type of query.
+    # Delete in favour of fewer specialisations or keep?
+    case str() if COMMAND.lower().startswith("select count(*) from"):
+        tbl_name = COMMAND.split(" ")[-1]
+        handle_count(tbl_name)
+    case str() if COMMAND.lower().startswith("select"):
+        handle_select(COMMAND)
+
+    case _:
+        print(f"Invalid command: {COMMAND}")
